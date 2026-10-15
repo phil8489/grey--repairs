@@ -4,54 +4,29 @@ session_start();
 if (
     !isset($_SESSION["user_id"]) ||
     !isset($_SESSION["role"]) ||
-    $_SESSION["role"] !== "technician"
+    $_SESSION["role"] !== "admin"
 ) {
-    header("Location: login.php");
+    header("Location: ../login.php");
     exit();
 }
 
 require_once "../config/database.php";
 
-$user_id = (int) $_SESSION["user_id"];
 $message = "";
 $message_type = "info";
 
-// Create a security token.
 if (!isset($_SESSION["csrf_token"])) {
     $_SESSION["csrf_token"] = bin2hex(random_bytes(32));
 }
 
-// Find the technician's profile.
-$stmt = $conn->prepare(
-    "SELECT id
-     FROM technicians
-     WHERE user_id = ?"
-);
-
-$stmt->bind_param("i", $user_id);
-$stmt->execute();
-
-$profile_result = $stmt->get_result();
-$profile = $profile_result->fetch_assoc();
-$stmt->close();
-
-if (!$profile) {
-    die("Technician profile not found.");
-}
-
-$technician_id = (int) $profile["id"];
-
-// Handle accept, reject, and complete actions.
+// Handle cancellation requests.
 if ($_SERVER["REQUEST_METHOD"] === "POST") {
-
     $token = $_POST["csrf_token"] ?? "";
     $booking_id = filter_input(
         INPUT_POST,
         "booking_id",
         FILTER_VALIDATE_INT
     );
-
-    $action = $_POST["action"] ?? "";
 
     if (
         !is_string($token) ||
@@ -65,68 +40,30 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
         $message_type = "error";
 
     } else {
+        // Only pending or accepted bookings may be cancelled.
+        $stmt = $conn->prepare(
+            "UPDATE bookings
+             SET status = 'cancelled'
+             WHERE id = ?
+               AND status IN ('pending', 'accepted')"
+        );
 
-        // Only allow these three actions.
-        $new_status = "";
+        $stmt->bind_param("i", $booking_id);
+        $stmt->execute();
 
-        if ($action === "accept") {
-            $new_status = "accepted";
-        } elseif ($action === "reject") {
-            $new_status = "rejected";
-        } elseif ($action === "complete") {
-            $new_status = "completed";
-        }
-
-        if ($new_status === "") {
-            $message = "Invalid action.";
-            $message_type = "error";
-
+        if ($stmt->affected_rows > 0) {
+            $message = "Booking cancelled successfully.";
+            $message_type = "success";
         } else {
-
-            // Pending bookings can be accepted or rejected.
-            // Accepted bookings can be marked completed.
-            if (
-                $new_status === "accepted" ||
-                $new_status === "rejected"
-            ) {
-                $old_status = "pending";
-            } else {
-                $old_status = "accepted";
-            }
-
-            $stmt = $conn->prepare(
-                "UPDATE bookings
-                 SET status = ?
-                 WHERE id = ?
-                   AND technician_id = ?
-                   AND status = ?"
-            );
-
-            $stmt->bind_param(
-                "siis",
-                $new_status,
-                $booking_id,
-                $technician_id,
-                $old_status
-            );
-
-            $stmt->execute();
-
-            if ($stmt->affected_rows > 0) {
-                $message = "Booking status updated to " .
-                    $new_status . ".";
-                $message_type = "success";
-            } else {
-                $message = "The booking could not be updated. It may already have been processed.";
-                $message_type = "error";
-            }
-
-            $stmt->close();
+            $message = "This booking cannot be cancelled. It may already have been processed.";
+            $message_type = "error";
         }
+
+        $stmt->close();
     }
 }
 
-// Retrieve bookings assigned to this technician.
+// Retrieve all bookings and related customer/technician details.
 $stmt = $conn->prepare(
     "SELECT
         b.id,
@@ -137,29 +74,21 @@ $stmt = $conn->prepare(
         b.service_location,
         b.status,
         b.created_at,
-        u.full_name AS customer_name,
-        u.email AS customer_email,
-        u.phone AS customer_phone
+        customer.full_name AS customer_name,
+        customer.email AS customer_email,
+        technician_user.full_name AS technician_name,
+        t.specialization
      FROM bookings b
-     INNER JOIN users u
-        ON b.customer_id = u.id
-     WHERE b.technician_id = ?
-     ORDER BY
-        CASE b.status
-            WHEN 'pending' THEN 1
-            WHEN 'accepted' THEN 2
-            WHEN 'completed' THEN 3
-            WHEN 'rejected' THEN 4
-            WHEN 'cancelled' THEN 5
-            ELSE 6
-        END,
-        b.appointment_date ASC,
-        b.appointment_time ASC"
+     INNER JOIN users customer
+        ON b.customer_id = customer.id
+     INNER JOIN technicians t
+        ON b.technician_id = t.id
+     INNER JOIN users technician_user
+        ON t.user_id = technician_user.id
+     ORDER BY b.created_at DESC"
 );
 
-$stmt->bind_param("i", $technician_id);
 $stmt->execute();
-
 $result = $stmt->get_result();
 ?>
 
@@ -169,7 +98,7 @@ $result = $stmt->get_result();
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
 
-    <title>Manage Bookings</title>
+    <title>Manage Bookings | Grey Repairs</title>
 
     <style>
         body {
@@ -177,25 +106,38 @@ $result = $stmt->get_result();
             background: #f4f6f9;
             margin: 0;
             padding: 20px;
+            color: #222;
         }
 
         .container {
-            max-width: 1000px;
+            max-width: 1150px;
             margin: auto;
         }
 
-        .booking {
+        .panel {
             background: white;
             padding: 20px;
-            margin-bottom: 20px;
             border-radius: 8px;
             box-shadow: 0 2px 6px #ddd;
+            overflow-x: auto;
+        }
+
+        .booking {
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            padding: 18px;
+            margin-bottom: 18px;
+        }
+
+        .status {
+            font-weight: bold;
+            text-transform: capitalize;
         }
 
         .message {
             padding: 12px;
-            margin: 15px 0;
             border-radius: 5px;
+            margin-bottom: 15px;
         }
 
         .success {
@@ -213,34 +155,21 @@ $result = $stmt->get_result();
             color: #0c5460;
         }
 
-        .status {
-            font-weight: bold;
-            text-transform: capitalize;
-        }
-
         button {
+            background: #dc3545;
+            color: white;
             padding: 10px 14px;
-            margin: 5px 5px 5px 0;
             border: none;
             border-radius: 4px;
             cursor: pointer;
-            color: white;
         }
 
-        .accept {
-            background: #198754;
-        }
-
-        .reject {
-            background: #dc3545;
-        }
-
-        .complete {
-            background: #0d6efd;
+        button:hover {
+            background: #b02a37;
         }
 
         a {
-            color: #0056b3;
+            color: #1d4ed8;
         }
     </style>
 <link rel="stylesheet" href="../style.css">
@@ -250,161 +179,148 @@ $result = $stmt->get_result();
 
 <div class="container">
 
-    <h1>Grey Repairs - Manage Bookings</h1>
-
-    <p>
-        Welcome,
-        <?php echo htmlspecialchars($_SESSION["full_name"]); ?>!
-    </p>
+    <h1>Grey Repairs - Manage All Bookings</h1>
 
     <?php if ($message !== ""): ?>
-        <div class="message <?php echo $message_type; ?>">
+        <div class="message <?php echo htmlspecialchars($message_type); ?>">
             <?php echo htmlspecialchars($message); ?>
         </div>
     <?php endif; ?>
 
-    <?php if ($result->num_rows === 0): ?>
+    <div class="panel">
 
-        <p>You have no repair bookings yet.</p>
+        <h2>All Repair Bookings</h2>
 
-    <?php else: ?>
+        <p>
+            Total bookings:
+            <strong><?php echo $result->num_rows; ?></strong>
+        </p>
 
-        <?php while ($booking = $result->fetch_assoc()): ?>
+        <?php if ($result->num_rows === 0): ?>
 
-            <div class="booking">
+            <p>No repair bookings have been submitted yet.</p>
 
-                <h2>
-                    Booking #<?php echo (int) $booking["id"]; ?>
-                </h2>
+        <?php else: ?>
 
-                <p>
-                    <strong>Customer:</strong>
-                    <?php echo htmlspecialchars($booking["customer_name"]); ?>
-                </p>
+            <?php while ($booking = $result->fetch_assoc()): ?>
 
-                <p>
-                    <strong>Customer email:</strong>
-                    <?php echo htmlspecialchars($booking["customer_email"] ?? "Not provided"); ?>
-                </p>
+                <div class="booking">
 
-                <p>
-                    <strong>Customer phone:</strong>
-                    <?php echo htmlspecialchars($booking["customer_phone"] ?? "Not provided"); ?>
-                </p>
+                    <h3>
+                        Booking #<?php echo (int) $booking["id"]; ?>
+                    </h3>
 
-                <p>
-                    <strong>Device:</strong>
-                    <?php echo htmlspecialchars($booking["device_type"]); ?>
-                </p>
+                    <p>
+                        <strong>Customer:</strong>
+                        <?php echo htmlspecialchars($booking["customer_name"]); ?>
+                    </p>
 
-                <p>
-                    <strong>Problem description:</strong><br>
+                    <p>
+                        <strong>Customer email:</strong>
+                        <?php echo htmlspecialchars($booking["customer_email"]); ?>
+                    </p>
+
+                    <p>
+                        <strong>Technician:</strong>
+                        <?php echo htmlspecialchars($booking["technician_name"]); ?>
+                    </p>
+
+                    <p>
+                        <strong>Specialization:</strong>
+                        <?php echo htmlspecialchars($booking["specialization"]); ?>
+                    </p>
+
+                    <p>
+                        <strong>Device:</strong>
+                        <?php echo htmlspecialchars($booking["device_type"]); ?>
+                    </p>
+
+                    <p>
+                        <strong>Problem description:</strong><br>
+                        <?php
+                        echo nl2br(
+                            htmlspecialchars($booking["problem_description"])
+                        );
+                        ?>
+                    </p>
+
+                    <p>
+                        <strong>Appointment date:</strong>
+                        <?php echo htmlspecialchars($booking["appointment_date"]); ?>
+                    </p>
+
+                    <p>
+                        <strong>Appointment time:</strong>
+                        <?php
+                        echo htmlspecialchars(
+                            date(
+                                "h:i A",
+                                strtotime($booking["appointment_time"])
+                            )
+                        );
+                        ?>
+                    </p>
+
+                    <p>
+                        <strong>Service location:</strong>
+                        <?php echo htmlspecialchars($booking["service_location"]); ?>
+                    </p>
+
+                    <p>
+                        <strong>Status:</strong>
+                        <span class="status">
+                            <?php echo htmlspecialchars($booking["status"]); ?>
+                        </span>
+                    </p>
+
+                    <p>
+                        <strong>Date submitted:</strong>
+                        <?php echo htmlspecialchars($booking["created_at"]); ?>
+                    </p>
+
                     <?php
-                    echo nl2br(
-                        htmlspecialchars($booking["problem_description"])
-                    );
+                    if (
+                        $booking["status"] === "pending" ||
+                        $booking["status"] === "accepted"
+                    ):
                     ?>
-                </p>
 
-                <p>
-                    <strong>Appointment date:</strong>
-                    <?php echo htmlspecialchars($booking["appointment_date"]); ?>
-                </p>
-
-                <p>
-                    <strong>Appointment time:</strong>
-                    <?php
-                    echo htmlspecialchars(
-                        date("h:i A", strtotime($booking["appointment_time"]))
-                    );
-                    ?>
-                </p>
-
-                <p>
-                    <strong>Service location:</strong>
-                    <?php echo htmlspecialchars($booking["service_location"]); ?>
-                </p>
-
-                <p>
-                    <strong>Status:</strong>
-                    <span class="status">
-                        <?php echo htmlspecialchars($booking["status"]); ?>
-                    </span>
-                </p>
-
-                <?php if ($booking["status"] === "pending"): ?>
-
-                    <form method="POST" action="manage-bookings.php">
-
-                        <input
-                            type="hidden"
-                            name="booking_id"
-                            value="<?php echo (int) $booking["id"]; ?>"
+                        <form
+                            method="POST"
+                            action="manage-bookings.php"
+                            onsubmit="return confirm('Are you sure you want to cancel this booking?');"
                         >
 
-                        <input
-                            type="hidden"
-                            name="csrf_token"
-                            value="<?php echo htmlspecialchars($_SESSION["csrf_token"]); ?>"
-                        >
+                            <input
+                                type="hidden"
+                                name="csrf_token"
+                                value="<?php echo htmlspecialchars($_SESSION["csrf_token"]); ?>"
+                            >
 
-                        <button
-                            class="accept"
-                            type="submit"
-                            name="action"
-                            value="accept"
-                        >
-                            Accept Booking
-                        </button>
+                            <input
+                                type="hidden"
+                                name="booking_id"
+                                value="<?php echo (int) $booking["id"]; ?>"
+                            >
 
-                        <button
-                            class="reject"
-                            type="submit"
-                            name="action"
-                            value="reject"
-                        >
-                            Reject Booking
-                        </button>
+                            <button type="submit">
+                                Cancel Booking
+                            </button>
 
-                    </form>
+                        </form>
 
-                <?php elseif ($booking["status"] === "accepted"): ?>
+                    <?php endif; ?>
 
-                    <form method="POST" action="manage-bookings.php">
+                </div>
 
-                        <input
-                            type="hidden"
-                            name="booking_id"
-                            value="<?php echo (int) $booking["id"]; ?>"
-                        >
+            <?php endwhile; ?>
 
-                        <input
-                            type="hidden"
-                            name="csrf_token"
-                            value="<?php echo htmlspecialchars($_SESSION["csrf_token"]); ?>"
-                        >
+        <?php endif; ?>
 
-                        <button
-                            class="complete"
-                            type="submit"
-                            name="action"
-                            value="complete"
-                        >
-                            Mark as Completed
-                        </button>
-
-                    </form>
-
-                <?php endif; ?>
-
-            </div>
-
-        <?php endwhile; ?>
-
-    <?php endif; ?>
+    </div>
 
     <p>
-        <a href="dashboard.php">Back to Technician Dashboard</a>
+        <a href="dashboard.php">Back to Admin Dashboard</a>
     </p>
 
     <p>
